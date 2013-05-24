@@ -1,3 +1,5 @@
+require 'securerandom'
+
 module Resque
   module Plugins
     module Status
@@ -24,7 +26,17 @@ module Resque
           val ? Resque::Plugins::Status::Hash.new(uuid, decode(val)) : nil
         end
 
-        # set a status by UUID. <tt>messages</tt> can be any number of stirngs or hashes
+        # Get multiple statuses by UUID. Returns array of Resque::Plugins::Status::Hash
+        def self.mget(uuids)
+          status_keys = uuids.map{|u| status_key(u)}
+          vals = redis.mget(*status_keys)
+
+          uuids.zip(vals).map do |uuid, val|
+            val ? Resque::Plugins::Status::Hash.new(uuid, decode(val)) : nil
+          end
+        end
+
+        # set a status by UUID. <tt>messages</tt> can be any number of strings or hashes
         # that are merged in order to create a single status.
         def self.set(uuid, *messages)
           val = Resque::Plugins::Status::Hash.new(uuid, *messages)
@@ -51,18 +63,17 @@ module Resque
           end
         end
 
+        def self.clear_failed(range_start = nil, range_end = nil)
+          status_ids(range_start, range_end).select do |id|
+            get(id).failed?
+          end.each do |id|
+            remove(id)
+          end
+        end
+
         def self.remove(uuid)
           redis.del(status_key(uuid))
           redis.zrem(set_key, uuid)
-        end
-        # returns a Redisk::Logger scoped to the UUID. Any options passed are passed
-        # to the logger initialization.
-        #
-        # Ensures that Redisk is logging to the same Redis connection as Resque.
-        def self.logger(uuid, options = {})
-          require 'redisk' unless defined?(Redisk)
-          Redisk.redis = redis
-          Redisk::Logger.new(logger_key(uuid), options)
         end
 
         def self.count
@@ -84,15 +95,15 @@ module Resque
         # Return the <tt>num</tt> most recent status/job UUIDs in reverse chronological order.
         def self.status_ids(range_start = nil, range_end = nil, reverse = true)
           method = reverse ? :zrevrange : :zrange
-          unless range_end && range_start
-            # Because we want a reverse chronological order, we need to get a range starting
-            # by the higest negative number.
-            redis.send(method, set_key, 0, -1) || []
-          else
+          if range_end && range_start
             # Because we want a reverse chronological order, we need to get a range starting
             # by the higest negative number. The ordering is transparent from the API user's
             # perspective so we need to convert the passed params
             (redis.send(method, set_key, (range_start.abs), ((range_end || 1).abs)) || [])
+          else
+            # Because we want a reverse chronological order, we need to get a range starting
+            # by the higest negative number.
+            redis.send(method, set_key, 0, -1) || []
           end
         end
 
@@ -156,13 +167,8 @@ module Resque
           "_kill"
         end
 
-        def self.logger_key(uuid)
-          "_log:#{uuid}"
-        end
-
         def self.generate_uuid
-          require 'uuid' unless defined?(UUID)
-          UUID.generate(:compact)
+          SecureRandom.hex.to_s
         end
 
         def self.hash_accessor(name, options = {})
